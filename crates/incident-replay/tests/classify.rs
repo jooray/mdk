@@ -1,7 +1,7 @@
 //! Classification behaviour, exercised through the public parse + classify API
 //! against synthetic, non-sensitive fixtures.
 
-use incident_replay::{QuarantineReason, Verdict, classify, parse};
+use incident_replay::{BehindEngine, BehindMode, QuarantineReason, Verdict, classify, parse};
 
 fn load(name: &str) -> incident_replay::AgentStateExport {
     let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -60,6 +60,77 @@ fn contested_convergence_outranks_a_missing_snapshot_fork() {
     assert_eq!(
         classify(&load("convergence-with-missing-snapshot-fork.json")),
         Verdict::ConvergenceSelected
+    );
+}
+
+#[test]
+fn partial_audit_coverage_alone_stays_healthy() {
+    // The group_context reports 3 members while only 2 engines contributed
+    // events. Audit is opt-in, so real groups routinely have more members than
+    // exporting engines (exp-07: six members, two engines); coverage alone is
+    // not an incident, and gating on it would quarantine those groups forever.
+    assert_eq!(
+        classify(&load("healthy-partial-audit-coverage.json")),
+        Verdict::Healthy
+    );
+}
+
+#[test]
+fn an_engine_the_group_advanced_past_quarantines_as_went_dark() {
+    // engine-a's audit stream ends at epoch 4 — with one stray event *within*
+    // the catch-up grace of the group reaching epoch 6 — so its lag reads as
+    // going dark, not as an engine demonstrably running without its commits.
+    assert_eq!(
+        classify(&load("quarantine-went-dark-engine.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 6,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-a".into(),
+                    epoch: 4,
+                    mode: BehindMode::WentDark,
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn an_active_engine_two_epochs_behind_quarantines_as_active_while_behind() {
+    // engine-b keeps recording events well past the catch-up grace after
+    // engine-a evidenced epoch 6, yet never advances beyond 4: commits are not
+    // reaching it while its other traffic flows.
+    assert_eq!(
+        classify(&load("quarantine-epoch-divergence.json")),
+        Verdict::Quarantine {
+            reason: QuarantineReason::EpochDivergence {
+                group_epoch: 6,
+                engines: vec![BehindEngine {
+                    engine_id: "engine-b".into(),
+                    epoch: 4,
+                    mode: BehindMode::ActiveWhileBehind,
+                }],
+            }
+        }
+    );
+}
+
+#[test]
+fn one_epoch_of_lag_is_routine_propagation_not_divergence() {
+    assert_eq!(
+        classify(&load("healthy-lagging-engine.json")),
+        Verdict::Healthy
+    );
+}
+
+#[test]
+fn a_reproducible_incident_outranks_the_liveness_gate() {
+    // A fork resolution is a replayable incident; an engine left behind
+    // elsewhere in the export must not preempt it (recovery fail-closes
+    // downstream if the data it needs turns out to be missing).
+    assert_eq!(
+        classify(&load("fork-recovery-with-behind-engine.json")),
+        Verdict::ForkRecovery
     );
 }
 
